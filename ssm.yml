@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create SecureString SSM parameter
+
+Resources:
+  
+  Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt Role.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+
+          http = urllib3.PoolManager()
+
+
+          def send(event, context, response_status, response_data, physical_resource_id):
+            response_url = event['ResponseURL']
+
+            response_body = {
+                'Status': response_status,
+                'Reason': f'See the details in CloudWatch Log Stream: {context.log_stream_name}',
+                'PhysicalResourceId': physical_resource_id,
+                'StackId': event['StackId'],
+                'RequestId': event['RequestId'],
+                'LogicalResourceId': event['LogicalResourceId'],
+                'NoEcho': False,
+                'Data': response_data
+            }
+
+            json_response_body = json.dumps(response_body)
+
+            headers = {
+                'content-type': '',
+                'content-length': str(len(json_response_body))
+            }
+
+            try:
+                response = http.request('PUT',response_url, body=json_response_body, headers=headers)
+                print(f"Status code: {response.status}")
+            except Exception as e:
+                print(f"send(..) failed executing requests.put(..): {e}")
+
+          def handler(event, context):
+            print(event)
+
+            ssm = boto3.client('ssm')
+            props = event['ResourceProperties']
+
+            split_stack_arn = event['StackId'].split(':')
+            region = split_stack_arn[3]
+            account_id = split_stack_arn[4]
+
+            stack_name = split_stack_arn[5].split("/")[1]
+            param_name = props.get('Name', f'cfn-{stack_name}-{event["LogicalResourceId"]}')
+            param_arn = f'arn:aws:ssm:{region}:{account_id}:parameter{param_name}'
+
+            try:
+                params = {
+                        'Name': param_name,
+                        'Type': props['Type'],
+                        'Value': props['Value'],
+                        'Overwrite': False
+                    }
+
+                if 'Description' in props:
+                        params['Description'] = props['Description']
+                if 'KeyId' in props:
+                        params['KeyId'] = props['KeyId']
+
+                if event['RequestType'] == 'Create':                      
+                    ssm.put_parameter(**params)
+                    send(event, context, 'SUCCESS', {'Arn': param_arn, 'Name': param_name}, param_arn)
+
+                elif event['RequestType'] == 'Update':
+                    params['Overwrite'] = True
+                    ssm.put_parameter(**params)
+                    send(event, context, 'SUCCESS', {'Arn': param_arn, 'Name': param_name}, param_arn)
+                
+                elif event['RequestType'] == 'Delete':
+                    ssm.delete_parameter(Name=param_name)
+                    send(event, context, 'SUCCESS', {'Arn': param_arn, 'Name': param_name}, param_arn)
+
+            except Exception as err:
+                print(err)
+                send(event, context, 'FAILED', {'Arn': param_arn, 'Name': param_name}, param_arn)
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: '/'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  - kms:Encrypt
+                Resource: '*'
+
+  SSMKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for daily
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:*
+            Resource: '*'
+
+  SSMKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: 'alias/ssm'
+      TargetKeyId: !Ref SSMKMSKey
+
+  sampleStringParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/app/test/APP_ENV'
+      Type: String
+      Value: production
+
+  securePassword:
+    Type: Custom::Lambda
+    Properties:
+      ServiceToken: !GetAtt Lambda.Arn
+      Type: SecureString
+      KeyId:
+        Fn::GetAtt:
+          - 'SSMKMSKey'
+          - 'Arn'
+      Value: 'APP_PASSWORD'
+      Name: !Sub 'app/test/APP_PASSWORD'      
+
+  secureAPIToken:
+    Type: Custom::Lambda
+    Properties:
+      ServiceToken: !GetAtt Lambda.Arn
+      Name: !Sub '/app/test/SECURE_TOKEN'
+      Type: SecureString
+      KeyId:
+        Fn::GetAtt:
+          - 'SSMKMSKey'
+          - 'Arn'
+      Value: 'SECURE_TOKEN'
+  
